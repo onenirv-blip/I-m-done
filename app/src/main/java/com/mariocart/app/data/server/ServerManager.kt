@@ -58,7 +58,7 @@ object ServerManager {
     private val _servers = MutableStateFlow<List<StreamingServer>>(emptyList())
     val liveServers: StateFlow<List<StreamingServer>> = _servers
 
-    // ── Public API ────────────────────────────────────────────────────────────
+    // ── Public API ─────────────────────────────────────────────────────────[...]
 
     fun init(context: Context) {
         prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -182,20 +182,24 @@ object ServerManager {
     }
 
     private fun probe(url: String): Boolean = try {
+        // Tiny ranged GET — providers reject HEAD with 405/403 even when the
+        // page works, which previously caused every server to be flagged
+        // "unreachable" on first launch.
         val req = Request.Builder()
             .url(url)
-            .head()
+            .get()
             .header("User-Agent",
                 "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
             .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
             .header("Accept-Language", "en-US,en;q=0.5")
+            .header("Range", "bytes=0-0")
             .build()
         val resp = client.newCall(req).execute()
         val code = resp.code
         resp.close()
-        // 200–399 = the page is there (redirect is fine); 404/5xx = skip
-        code in 200..399
+        // Anything that isn't a server crash is reachable enough to attempt.
+        code < 500
     } catch (_: Exception) { false }
 
     private fun sortBySuccess(servers: List<StreamingServer>): List<StreamingServer> {
