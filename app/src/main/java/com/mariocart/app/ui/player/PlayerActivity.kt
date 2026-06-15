@@ -52,6 +52,10 @@ class PlayerActivity : AppCompatActivity() {
 
         private const val MIN_DURATION_MS    = 5 * 60 * 1000L
         private const val EXTRACT_TIMEOUT_MS = 20_000L
+        // Cap how many servers we auto-step through on a single failure burst,
+        // so the SOURCE picker still has plenty of untried entries when the
+        // user opens it after an auto-fallback gives up.
+        private const val MAX_AUTO_FALLBACK  = 4
 
         fun newIntent(
             context: Context,
@@ -72,6 +76,10 @@ class PlayerActivity : AppCompatActivity() {
     // ── Server / content state ────────────────────────────────────────────────
     private var servers: List<StreamingServer> = emptyList()
     private var currentServerIndex = 0
+    // Index where the current auto-fallback burst began — used together with
+    // MAX_AUTO_FALLBACK to stop the player from chewing through every server
+    // in one go after a single failure.
+    private var failureStartIndex = 0
     private var tmdbId = 0
     private var contentType = "movie"
     private var season = 1
@@ -90,7 +98,7 @@ class PlayerActivity : AppCompatActivity() {
     private var savedPositionMs = 0L
     private var selectedMaxHeight = Int.MAX_VALUE
 
-    // ── Views ─────────────────────────────────────────────────────────────────
+    // ── Views ──────────────────────────────────────────────────────────────────
     private lateinit var playerView: PlayerView
     private lateinit var loadingOverlay: FrameLayout
     private lateinit var loadingTitle: TextView
@@ -135,7 +143,7 @@ class PlayerActivity : AppCompatActivity() {
         initServersAndPlay()
     }
 
-    // ── Layout ────────────────────────────────────────────────────────────────
+    // ── Layout ─────────────────────────────────────────────────────────────────
     private fun buildLayout() {
         val root = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -169,7 +177,7 @@ class PlayerActivity : AppCompatActivity() {
             maxLines = 2
         }
         loadingDots = TextView(this).apply {
-            text = "⬤  ⬤  ⬤"
+            text = "⬘  ⬘  ⬘"
             setTextColor(Color.parseColor("#555555"))
             textSize = 14f
             gravity = Gravity.CENTER
@@ -336,21 +344,26 @@ class PlayerActivity : AppCompatActivity() {
         return overlay
     }
 
-    // ── Initialization ────────────────────────────────────────────────────────
+    // ── Initialization ─────────────────────────────────────────────────────────
     private fun initServersAndPlay() {
         startDotsAnimation()
         lifecycleScope.launch {
             ServerManager.initialize(this@PlayerActivity)
             val raw = ServerManager.getOrderedServers()
             servers = ServerTester.rankForContent(raw, tmdbId, contentType, season, episode)
+            failureStartIndex = 0
             loadServer(0)
         }
     }
 
-    // ── Server loading — uses StreamExtractor, no WebView ─────────────────────
+    // ── Server loading — uses StreamExtractor, no WebView ──────────────────────
     private fun loadServer(index: Int) {
         if (index >= servers.size) {
-            showError("No working stream found.\nTap SOURCE to pick manually.")
+            // Reached the end of the list — reset the cursor so the SOURCE picker
+            // doesn't render every entry with a ✓ "already tried" marker (which
+            // made the list look empty/consumed when the user reopened it).
+            currentServerIndex = 0
+            showError("No working stream found.\nTap SOURCE to pick another.")
             return
         }
         currentServerIndex = index
@@ -371,6 +384,11 @@ class PlayerActivity : AppCompatActivity() {
             if (videoUrl != null) {
                 onVideoUrlFound(videoUrl)
             } else {
+                // Extraction can fail for transient reasons (JS-only player,
+                // momentary 5xx, slow CDN). Deprioritise but DO NOT cascade
+                // through every remaining server in one go — that was burning
+                // the whole list before the user could react. Try just the
+                // next one, then stop.
                 ServerManager.markServerDead(server.name)
                 tryNextServer()
             }
@@ -379,11 +397,16 @@ class PlayerActivity : AppCompatActivity() {
 
     private fun tryNextServer() {
         val next = currentServerIndex + 1
-        if (next < servers.size) loadServer(next)
-        else showError("All sources tried.\nTap SOURCE to pick manually.")
+        if (next < servers.size && next - failureStartIndex < MAX_AUTO_FALLBACK) {
+            loadServer(next)
+        } else {
+            currentServerIndex = 0
+            failureStartIndex = 0
+            showError("Couldn't auto-find a working source.\nTap SOURCE to pick one.")
+        }
     }
 
-    // ── URL found → start ExoPlayer ───────────────────────────────────────────
+    // ── URL found → start ExoPlayer ────────────────────────────────────────────
     private fun onVideoUrlFound(videoUrl: String) {
         ServerManager.markServerSuccess(servers.getOrNull(currentServerIndex)?.name ?: "")
 
@@ -449,7 +472,7 @@ class PlayerActivity : AppCompatActivity() {
         })
     }
 
-    // ── Player controls ───────────────────────────────────────────────────────
+    // ── Player controls ────────────────────────────────────────────────────────
     private fun showPlayerControls() {
         loadingOverlay.visibility = View.GONE
         controlsOverlay.visibility = View.VISIBLE
@@ -528,14 +551,14 @@ class PlayerActivity : AppCompatActivity() {
         if (pos > 3_000L) handler.postDelayed({ exoPlayer?.seekTo(pos) }, 600L)
     }
 
-    // ── ExoPlayer release ─────────────────────────────────────────────────────
+    // ── ExoPlayer release ──────────────────────────────────────────────────────
     private fun releaseExoPlayer() {
         stopProgressUpdater()
         exoPlayer?.release(); exoPlayer = null
         isPlaying = false
     }
 
-    // ── Quality picker ────────────────────────────────────────────────────────
+    // ── Quality picker ─────────────────────────────────────────────────────────
     private fun showQualityPicker() {
         val labels  = arrayOf("Auto", "1080p", "720p", "480p", "360p")
         val heights = intArrayOf(Int.MAX_VALUE, 1080, 720, 480, 360)
@@ -553,7 +576,7 @@ class PlayerActivity : AppCompatActivity() {
         dialog.show()
     }
 
-    // ── Server picker ─────────────────────────────────────────────────────────
+    // ── Server picker ──────────────────────────────────────────────────────────
     private fun showServerPicker() {
         cancelAutoHide()
         val serverNames = servers.mapIndexed { i, s ->
@@ -569,6 +592,9 @@ class PlayerActivity : AppCompatActivity() {
         dialog.setContentView(buildPickerDialog("Select Source", serverNames) { idx ->
             if (idx != currentServerIndex) {
                 savedPositionMs = exoPlayer?.currentPosition ?: 0L
+                // User manually picked a source — restart the auto-fallback
+                // budget from here so we don't immediately give up.
+                failureStartIndex = idx
                 showLoadingOverlay()
                 loadServer(idx)
             }
@@ -614,7 +640,7 @@ class PlayerActivity : AppCompatActivity() {
         return wrapper
     }
 
-    // ── Loading UI ────────────────────────────────────────────────────────────
+    // ── Loading UI ─────────────────────────────────────────────────────────────
     private fun setLoadingStatus(msg: String) = handler.post { loadingStatus.text = msg }
 
     private fun showError(msg: String) = handler.post {
@@ -636,7 +662,7 @@ class PlayerActivity : AppCompatActivity() {
     private fun startDotsAnimation() {
         stopDotsAnimation()
         dotsRunnable = object : Runnable {
-            private val states = listOf("⬤  ○  ○", "○  ⬤  ○", "○  ○  ⬤", "○  ⬤  ○")
+            private val states = listOf("⬘  ○  ○", "○  ⬘  ○", "○  ○  ⬘", "○  ⬘  ○")
             override fun run() {
                 loadingDots.text = states[dotsCount % states.size]
                 dotsCount++
@@ -651,7 +677,7 @@ class PlayerActivity : AppCompatActivity() {
         dotsRunnable = null
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    // ── Lifecycle ──────────────────────────────────────────────────────────────
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (keyCode == KeyEvent.KEYCODE_BACK) { finish(); return true }
         return super.onKeyDown(keyCode, event)
@@ -679,7 +705,7 @@ class PlayerActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    // ── Utilities ─────────────────────────────────────────────────────────────
+    // ── Utilities ──────────────────────────────────────────────────────────────
     private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
     private val WRAP  = ViewGroup.LayoutParams.WRAP_CONTENT
 
