@@ -85,15 +85,19 @@ object ServerTester {
     private fun probeUrl(url: String): Long? {
         return try {
             val start = System.currentTimeMillis()
+            // Use a tiny ranged GET — most embed providers reject HEAD with 405/403
+            // even when the page is perfectly playable, which made every server
+            // get marked "failed" in the previous version.
             val request = Request.Builder()
                 .url(url)
-                .head()
+                .get()
                 .header(
                     "User-Agent",
                     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
                 )
                 .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
                 .header("Accept-Language", "en-US,en;q=0.5")
+                .header("Range", "bytes=0-0")
                 .build()
 
             val response = client.newCall(request).execute()
@@ -102,10 +106,10 @@ object ServerTester {
 
             val elapsed = System.currentTimeMillis() - start
 
-            // Only accept 200–299: the server must actually have the content.
-            // 404 means content not found — treat as failure so we skip to next server.
-            // 403 means blocked — also skip. 5xx = server error — skip.
-            if (code in 200..299) elapsed else null
+            // Accept anything that isn't a hard failure. Many providers return
+            // 200/206/301/302/403/405 for embed URLs that still render fine in
+            // the player — only 5xx and total network failures should disqualify.
+            if (code < 500) elapsed else null
         } catch (e: Exception) {
             Log.d(TAG, "Probe failed for $url: ${e.message}")
             null
